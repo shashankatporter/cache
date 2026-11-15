@@ -1,6 +1,7 @@
 // https://github.com/actions/toolkit/blob/%40actions/cache%403.2.2/packages/cache/src/cache.ts
 
 import * as utils from "@actions/cache/lib/internal/cacheUtils";
+import { CompressionMethod } from "@actions/cache/lib/internal/constants";
 import {
     createTar,
     extractTar,
@@ -8,6 +9,8 @@ import {
 } from "@actions/cache/lib/internal/tar";
 import { DownloadOptions, UploadOptions } from "@actions/cache/lib/options";
 import * as core from "@actions/core";
+import * as exec from "@actions/exec";
+import * as io from "@actions/io";
 import * as path from "path";
 
 // cloud provider clients
@@ -73,6 +76,32 @@ export function isFeatureAvailable(): boolean {
     return !!process.env["ACTIONS_CACHE_URL"];
 }
 
+// tar extracts the start of a truncated archive before it fails, which leaves a
+// half-populated cache behind, so test the whole archive before extracting it.
+async function archiveIntegrityError(
+    archivePath: string,
+    compressionMethod: CompressionMethod
+): Promise<string | undefined> {
+    const tool = compressionMethod === CompressionMethod.Gzip ? "gzip" : "zstd";
+    const args =
+        compressionMethod === CompressionMethod.Zstd
+            ? ["--long=30", "-t", archivePath]
+            : ["-t", archivePath];
+    if (!(await io.which(tool))) {
+        core.debug(`${tool} not found, skipping the archive integrity check`);
+        return undefined;
+    }
+
+    const { exitCode, stderr } = await exec.getExecOutput(tool, args, {
+        ignoreReturnCode: true,
+        silent: true
+    });
+    if (exitCode === 0) {
+        return undefined;
+    }
+    return stderr.trim() || `${tool} -t exited with ${exitCode}`;
+}
+
 /**
  * Restores cache from keys
  *
@@ -108,51 +137,71 @@ export async function restoreCache(
     }
 
     const compressionMethod = await utils.getCompressionMethod();
+    const storageClient = getStorageClient();
+    const triedArchives = new Set<string>();
     let archivePath = "";
     try {
-        // path are needed to compute version
-        const cacheEntry = await getStorageClient().getCacheEntry(keys, paths, {
-            compressionMethod,
-            enableCrossOsArchive
-        });
-        if (!cacheEntry?.archiveLocation) {
-            // Cache not found
-            return undefined;
-        }
+        // One key at a time, so a corrupt archive falls back to the next key
+        for (const key of keys) {
+            // path are needed to compute version
+            const cacheEntry = await storageClient.getCacheEntry([key], paths, {
+                compressionMethod,
+                enableCrossOsArchive
+            });
+            const archiveLocation = cacheEntry?.archiveLocation;
+            if (!archiveLocation || triedArchives.has(archiveLocation)) {
+                continue;
+            }
+            triedArchives.add(archiveLocation);
 
-        if (options?.lookupOnly) {
-            core.info("Lookup only - skipping download");
+            if (options?.lookupOnly) {
+                core.info("Lookup only - skipping download");
+                return cacheEntry.cacheKey;
+            }
+
+            if (!archivePath) {
+                archivePath = path.join(
+                    await utils.createTempDirectory(),
+                    utils.getCacheFileName(compressionMethod)
+                );
+                core.debug(`Archive Path: ${archivePath}`);
+            }
+
+            // Download the cache from the cache entry
+            await storageClient.downloadCache(
+                archiveLocation,
+                archivePath,
+                options
+            );
+
+            const integrityError = await archiveIntegrityError(
+                archivePath,
+                compressionMethod
+            );
+            if (integrityError) {
+                core.warning(
+                    `Skipping corrupt cache ${cacheEntry.cacheKey}: ${integrityError}`
+                );
+                continue;
+            }
+
+            if (core.isDebug()) {
+                await listTar(archivePath, compressionMethod);
+            }
+
+            const archiveFileSize =
+                utils.getArchiveFileSizeInBytes(archivePath);
+            core.info(
+                `Cache Size: ~${Math.round(
+                    archiveFileSize / (1024 * 1024)
+                )} MB (${archiveFileSize} B)`
+            );
+
+            await extractTar(archivePath, compressionMethod);
+            core.info("Cache restored successfully");
+
             return cacheEntry.cacheKey;
         }
-
-        archivePath = path.join(
-            await utils.createTempDirectory(),
-            utils.getCacheFileName(compressionMethod)
-        );
-        core.debug(`Archive Path: ${archivePath}`);
-
-        // Download the cache from the cache entry
-        await getStorageClient().downloadCache(
-            cacheEntry.archiveLocation,
-            archivePath,
-            options
-        );
-
-        if (core.isDebug()) {
-            await listTar(archivePath, compressionMethod);
-        }
-
-        const archiveFileSize = utils.getArchiveFileSizeInBytes(archivePath);
-        core.info(
-            `Cache Size: ~${Math.round(
-                archiveFileSize / (1024 * 1024)
-            )} MB (${archiveFileSize} B)`
-        );
-
-        await extractTar(archivePath, compressionMethod);
-        core.info("Cache restored successfully");
-
-        return cacheEntry.cacheKey;
     } catch (error) {
         const typedError = error as Error;
         if (typedError.name === ValidationError.name) {
