@@ -28,6 +28,14 @@ const downloadQueueSize = Number(process.env.DOWNLOAD_QUEUE_SIZE || "8");
 const downloadPartSize =
     Number(process.env.DOWNLOAD_PART_SIZE || "32") * 1024 * 1024;
 
+// A parallel upload stages <key>.partN and <key>.composedG_I before it composes
+// <key>. They share the key's prefix but each is only a fragment of the archive.
+const uploadTempName = /\.(part\d+|composed\d+_\d+)$/;
+
+export function isUploadTemp(objectName: string): boolean {
+    return uploadTempName.test(objectName);
+}
+
 export function getCacheVersion(
     paths: string[],
     compressionMethod?: CompressionMethod,
@@ -79,9 +87,19 @@ export async function getCacheEntry(
         const [files] = await bucket.getFiles({
             prefix: `${gcsPrefix}/${restoreKey}`
         });
+        const archives = files.filter(
+            f => !isUploadTemp(f.name) && String(f.metadata.size) !== "0"
+        );
+        if (archives.length < files.length) {
+            core.info(
+                `Ignoring ${
+                    files.length - archives.length
+                } unfinished upload object(s) matching ${restoreKey}`
+            );
+        }
 
-        if (files.length > 0) {
-            const sortedFiles = files.sort((a, b) => {
+        if (archives.length > 0) {
+            const sortedFiles = archives.sort((a, b) => {
                 // metadata.updated is an RFC3339 string (e.g. "2026-06-06T04:48:26.123Z");
                 // Number() of that is NaN, which made this comparator a no-op and the
                 // "most recent" pick silently degrade to GCS list order (lexicographic).
@@ -191,7 +209,8 @@ async function uploadInParallel(
     bucketName: string,
     archivePath: string,
     gcsKey: string,
-    fileSize: number
+    fileSize: number,
+    tempFiles: string[]
 ): Promise<void> {
     const partSize = uploadPartSize;
     const concurrency = uploadQueueSize;
@@ -232,6 +251,7 @@ async function uploadInParallel(
             partKey: `${gcsKey}.part${partNumber}`
         });
     }
+    tempFiles.push(...parts.map(part => part.partKey));
 
     core.info(`Uploading ${parts.length} parts in parallel...`);
 
@@ -282,7 +302,6 @@ async function uploadInParallel(
     // Compose all parts into the final object
     const bucket = storage.bucket(bucketName);
     const partFiles = parts.map(part => bucket.file(part.partKey));
-    const allTempFiles: string[] = partFiles.map(f => f.name);
 
     // GCS compose has a limit of 32 source objects
     // If we have more, we need to compose in batches hierarchically
@@ -302,10 +321,8 @@ async function uploadInParallel(
             const batch = sourceFiles.slice(i, i + batchSize);
             const composedKey = `${gcsKey}.composed${generation}_${Math.floor(i / batchSize)}`;
             composedFiles.push(composedKey);
-            allTempFiles.push(composedKey);
+            tempFiles.push(composedKey);
 
-            const composedFile = bucket.file(composedKey);
-            await composedFile.save("", { resumable: false });
             await bucket.combine(batch, composedKey);
 
             core.debug(
@@ -322,20 +339,41 @@ async function uploadInParallel(
     );
 
     // Final compose
-    const finalFile = bucket.file(gcsKey);
-    await finalFile.save("", { resumable: false });
     await bucket.combine(sourceFiles, gcsKey);
 
     core.info("Composed final object, cleaning up temporary files...");
 
-    // Delete all temporary files (parts and intermediate composed files)
-    await Promise.all(
-        allTempFiles.map(fileName =>
-            bucket.file(fileName).delete().catch(() => {})
-        )
-    );
+    await deleteObjects(tempFiles);
 
     core.info("Parallel upload completed successfully");
+}
+
+async function deleteObjects(names: string[]): Promise<void> {
+    await Promise.all(
+        names.map(name =>
+            bucket
+                .file(name)
+                .delete({ ignoreNotFound: true })
+                .catch(error =>
+                    core.debug(
+                        `Failed to delete ${name}: ${(error as Error).message}`
+                    )
+                )
+        )
+    );
+}
+
+// Parts left by an earlier save of this key that was killed before it could
+// delete them. This save has just replaced that key, so they are garbage.
+async function deleteStaleUploadTemps(gcsKey: string): Promise<void> {
+    try {
+        const [files] = await bucket.getFiles({ prefix: `${gcsKey}.` });
+        await deleteObjects(files.map(f => f.name).filter(isUploadTemp));
+    } catch (error) {
+        core.info(
+            `Could not clean up stale upload parts: ${(error as Error).message}`
+        );
+    }
 }
 
 export async function saveCache(
@@ -380,8 +418,39 @@ export async function saveCache(
     // Initialize GCS client
     const storage = new Storage();
 
-    // Use parallel upload for better performance
-    await uploadInParallel(storage, bucketName, archivePath, gcsKey, cacheSize);
+    // A cancelled step gets SIGINT, then SIGTERM. Delete what this upload has
+    // staged so a cancellation doesn't strand its parts in the bucket.
+    const tempFiles: string[] = [];
+    const onSignal = (signal: NodeJS.Signals): void => {
+        process.removeListener("SIGINT", onSignal);
+        process.removeListener("SIGTERM", onSignal);
+        core.warning(`${signal} received, deleting the partial upload`);
+        void deleteObjects(tempFiles).then(() =>
+            process.kill(process.pid, signal)
+        );
+    };
+    process.on("SIGINT", onSignal);
+    process.on("SIGTERM", onSignal);
+
+    try {
+        // Use parallel upload for better performance
+        await uploadInParallel(
+            storage,
+            bucketName,
+            archivePath,
+            gcsKey,
+            cacheSize,
+            tempFiles
+        );
+    } catch (error) {
+        await deleteObjects(tempFiles);
+        throw error;
+    } finally {
+        process.removeListener("SIGINT", onSignal);
+        process.removeListener("SIGTERM", onSignal);
+    }
+
+    await deleteStaleUploadTemps(gcsKey);
 
     core.info("Cache saved successfully.");
 }

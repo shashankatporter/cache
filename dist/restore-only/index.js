@@ -121445,8 +121445,11 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.saveCache = exports.restoreCache = exports.isFeatureAvailable = exports.ReserveCacheError = exports.ValidationError = void 0;
 const utils = __importStar(__nccwpck_require__(91518));
+const constants_1 = __nccwpck_require__(88840);
 const tar_1 = __nccwpck_require__(56490);
 const core = __importStar(__nccwpck_require__(42186));
+const exec = __importStar(__nccwpck_require__(71514));
+const io = __importStar(__nccwpck_require__(47351));
 const path = __importStar(__nccwpck_require__(71017));
 // cloud provider clients
 const gcsClient = __importStar(__nccwpck_require__(32115));
@@ -121504,6 +121507,28 @@ function isFeatureAvailable() {
     return !!process.env["ACTIONS_CACHE_URL"];
 }
 exports.isFeatureAvailable = isFeatureAvailable;
+// tar extracts the start of a truncated archive before it fails, which leaves a
+// half-populated cache behind, so test the whole archive before extracting it.
+function archiveIntegrityError(archivePath, compressionMethod) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const tool = compressionMethod === constants_1.CompressionMethod.Gzip ? "gzip" : "zstd";
+        const args = compressionMethod === constants_1.CompressionMethod.Zstd
+            ? ["--long=30", "-t", archivePath]
+            : ["-t", archivePath];
+        if (!(yield io.which(tool))) {
+            core.debug(`${tool} not found, skipping the archive integrity check`);
+            return undefined;
+        }
+        const { exitCode, stderr } = yield exec.getExecOutput(tool, args, {
+            ignoreReturnCode: true,
+            silent: true
+        });
+        if (exitCode === 0) {
+            return undefined;
+        }
+        return stderr.trim() || `${tool} -t exited with ${exitCode}`;
+    });
+}
 /**
  * Restores cache from keys
  *
@@ -121528,33 +121553,46 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
             checkKey(key);
         }
         const compressionMethod = yield utils.getCompressionMethod();
+        const storageClient = getStorageClient();
+        const triedArchives = new Set();
         let archivePath = "";
         try {
-            // path are needed to compute version
-            const cacheEntry = yield getStorageClient().getCacheEntry(keys, paths, {
-                compressionMethod,
-                enableCrossOsArchive
-            });
-            if (!(cacheEntry === null || cacheEntry === void 0 ? void 0 : cacheEntry.archiveLocation)) {
-                // Cache not found
-                return undefined;
-            }
-            if (options === null || options === void 0 ? void 0 : options.lookupOnly) {
-                core.info("Lookup only - skipping download");
+            // One key at a time, so a corrupt archive falls back to the next key
+            for (const key of keys) {
+                // path are needed to compute version
+                const cacheEntry = yield storageClient.getCacheEntry([key], paths, {
+                    compressionMethod,
+                    enableCrossOsArchive
+                });
+                const archiveLocation = cacheEntry === null || cacheEntry === void 0 ? void 0 : cacheEntry.archiveLocation;
+                if (!archiveLocation || triedArchives.has(archiveLocation)) {
+                    continue;
+                }
+                triedArchives.add(archiveLocation);
+                if (options === null || options === void 0 ? void 0 : options.lookupOnly) {
+                    core.info("Lookup only - skipping download");
+                    return cacheEntry.cacheKey;
+                }
+                if (!archivePath) {
+                    archivePath = path.join(yield utils.createTempDirectory(), utils.getCacheFileName(compressionMethod));
+                    core.debug(`Archive Path: ${archivePath}`);
+                }
+                // Download the cache from the cache entry
+                yield storageClient.downloadCache(archiveLocation, archivePath, options);
+                const integrityError = yield archiveIntegrityError(archivePath, compressionMethod);
+                if (integrityError) {
+                    core.warning(`Skipping corrupt cache ${cacheEntry.cacheKey}: ${integrityError}`);
+                    continue;
+                }
+                if (core.isDebug()) {
+                    yield (0, tar_1.listTar)(archivePath, compressionMethod);
+                }
+                const archiveFileSize = utils.getArchiveFileSizeInBytes(archivePath);
+                core.info(`Cache Size: ~${Math.round(archiveFileSize / (1024 * 1024))} MB (${archiveFileSize} B)`);
+                yield (0, tar_1.extractTar)(archivePath, compressionMethod);
+                core.info("Cache restored successfully");
                 return cacheEntry.cacheKey;
             }
-            archivePath = path.join(yield utils.createTempDirectory(), utils.getCacheFileName(compressionMethod));
-            core.debug(`Archive Path: ${archivePath}`);
-            // Download the cache from the cache entry
-            yield getStorageClient().downloadCache(cacheEntry.archiveLocation, archivePath, options);
-            if (core.isDebug()) {
-                yield (0, tar_1.listTar)(archivePath, compressionMethod);
-            }
-            const archiveFileSize = utils.getArchiveFileSizeInBytes(archivePath);
-            core.info(`Cache Size: ~${Math.round(archiveFileSize / (1024 * 1024))} MB (${archiveFileSize} B)`);
-            yield (0, tar_1.extractTar)(archivePath, compressionMethod);
-            core.info("Cache restored successfully");
-            return cacheEntry.cacheKey;
         }
         catch (error) {
             const typedError = error;
@@ -121683,7 +121721,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.saveCache = exports.downloadCache = exports.getCacheEntry = exports.getCacheVersion = void 0;
+exports.saveCache = exports.downloadCache = exports.getCacheEntry = exports.getCacheVersion = exports.isUploadTemp = void 0;
 const core = __importStar(__nccwpck_require__(42186));
 const storage_1 = __nccwpck_require__(27577);
 const crypto = __importStar(__nccwpck_require__(6113));
@@ -121698,6 +121736,13 @@ const uploadQueueSize = Number(process.env.UPLOAD_QUEUE_SIZE || "4");
 const uploadPartSize = Number(process.env.UPLOAD_PART_SIZE || "64") * 1024 * 1024;
 const downloadQueueSize = Number(process.env.DOWNLOAD_QUEUE_SIZE || "8");
 const downloadPartSize = Number(process.env.DOWNLOAD_PART_SIZE || "32") * 1024 * 1024;
+// A parallel upload stages <key>.partN and <key>.composedG_I before it composes
+// <key>. They share the key's prefix but each is only a fragment of the archive.
+const uploadTempName = /\.(part\d+|composed\d+_\d+)$/;
+function isUploadTemp(objectName) {
+    return uploadTempName.test(objectName);
+}
+exports.isUploadTemp = isUploadTemp;
 function getCacheVersion(paths, compressionMethod, enableCrossOsArchive = false) {
     const components = paths.slice();
     if (compressionMethod) {
@@ -121729,8 +121774,12 @@ function getCacheEntry(keys, paths, { compressionMethod, enableCrossOsArchive })
             const [files] = yield bucket.getFiles({
                 prefix: `${gcsPrefix}/${restoreKey}`
             });
-            if (files.length > 0) {
-                const sortedFiles = files.sort((a, b) => {
+            const archives = files.filter(f => !isUploadTemp(f.name) && String(f.metadata.size) !== "0");
+            if (archives.length < files.length) {
+                core.info(`Ignoring ${files.length - archives.length} unfinished upload object(s) matching ${restoreKey}`);
+            }
+            if (archives.length > 0) {
+                const sortedFiles = archives.sort((a, b) => {
                     // metadata.updated is an RFC3339 string (e.g. "2026-06-06T04:48:26.123Z");
                     // Number() of that is NaN, which made this comparator a no-op and the
                     // "most recent" pick silently degrade to GCS list order (lexicographic).
@@ -121800,7 +121849,7 @@ function uploadPartWithRetry(storage, bucketName, archivePath, part, retries = 3
         throw new Error(`Failed to upload part ${part.partNumber} after ${retries} attempts: ${lastError === null || lastError === void 0 ? void 0 : lastError.message}`);
     });
 }
-function uploadInParallel(storage, bucketName, archivePath, gcsKey, fileSize) {
+function uploadInParallel(storage, bucketName, archivePath, gcsKey, fileSize, tempFiles) {
     return __awaiter(this, void 0, void 0, function* () {
         const partSize = uploadPartSize;
         const concurrency = uploadQueueSize;
@@ -121832,6 +121881,7 @@ function uploadInParallel(storage, bucketName, archivePath, gcsKey, fileSize) {
                 partKey: `${gcsKey}.part${partNumber}`
             });
         }
+        tempFiles.push(...parts.map(part => part.partKey));
         core.info(`Uploading ${parts.length} parts in parallel...`);
         // Upload parts with controlled concurrency
         const activeUploads = [];
@@ -121867,7 +121917,6 @@ function uploadInParallel(storage, bucketName, archivePath, gcsKey, fileSize) {
         // Compose all parts into the final object
         const bucket = storage.bucket(bucketName);
         const partFiles = parts.map(part => bucket.file(part.partKey));
-        const allTempFiles = partFiles.map(f => f.name);
         // GCS compose has a limit of 32 source objects
         // If we have more, we need to compose in batches hierarchically
         const MAX_COMPOSE_COUNT = 32;
@@ -121881,9 +121930,7 @@ function uploadInParallel(storage, bucketName, archivePath, gcsKey, fileSize) {
                 const batch = sourceFiles.slice(i, i + batchSize);
                 const composedKey = `${gcsKey}.composed${generation}_${Math.floor(i / batchSize)}`;
                 composedFiles.push(composedKey);
-                allTempFiles.push(composedKey);
-                const composedFile = bucket.file(composedKey);
-                yield composedFile.save("", { resumable: false });
+                tempFiles.push(composedKey);
                 yield bucket.combine(batch, composedKey);
                 core.debug(`Composed batch ${Math.floor(i / batchSize) + 1}: ${batch.length} parts into ${composedKey}`);
             }
@@ -121892,13 +121939,31 @@ function uploadInParallel(storage, bucketName, archivePath, gcsKey, fileSize) {
         }
         core.info(`Creating final object from ${sourceFiles.length} intermediate file(s)...`);
         // Final compose
-        const finalFile = bucket.file(gcsKey);
-        yield finalFile.save("", { resumable: false });
         yield bucket.combine(sourceFiles, gcsKey);
         core.info("Composed final object, cleaning up temporary files...");
-        // Delete all temporary files (parts and intermediate composed files)
-        yield Promise.all(allTempFiles.map(fileName => bucket.file(fileName).delete().catch(() => { })));
+        yield deleteObjects(tempFiles);
         core.info("Parallel upload completed successfully");
+    });
+}
+function deleteObjects(names) {
+    return __awaiter(this, void 0, void 0, function* () {
+        yield Promise.all(names.map(name => bucket
+            .file(name)
+            .delete({ ignoreNotFound: true })
+            .catch(error => core.debug(`Failed to delete ${name}: ${error.message}`))));
+    });
+}
+// Parts left by an earlier save of this key that was killed before it could
+// delete them. This save has just replaced that key, so they are garbage.
+function deleteStaleUploadTemps(gcsKey) {
+    return __awaiter(this, void 0, void 0, function* () {
+        try {
+            const [files] = yield bucket.getFiles({ prefix: `${gcsKey}.` });
+            yield deleteObjects(files.map(f => f.name).filter(isUploadTemp));
+        }
+        catch (error) {
+            core.info(`Could not clean up stale upload parts: ${error.message}`);
+        }
     });
 }
 function saveCache(key, paths, archivePath, { compressionMethod, enableCrossOsArchive, cacheSize: archiveFileSize }) {
@@ -121920,8 +121985,30 @@ function saveCache(key, paths, archivePath, { compressionMethod, enableCrossOsAr
         core.info(`Uploading cache from ${archivePath} to gs://${bucketName}/${gcsKey}`);
         // Initialize GCS client
         const storage = new storage_1.Storage();
-        // Use parallel upload for better performance
-        yield uploadInParallel(storage, bucketName, archivePath, gcsKey, cacheSize);
+        // A cancelled step gets SIGINT, then SIGTERM. Delete what this upload has
+        // staged so a cancellation doesn't strand its parts in the bucket.
+        const tempFiles = [];
+        const onSignal = (signal) => {
+            process.removeListener("SIGINT", onSignal);
+            process.removeListener("SIGTERM", onSignal);
+            core.warning(`${signal} received, deleting the partial upload`);
+            void deleteObjects(tempFiles).then(() => process.kill(process.pid, signal));
+        };
+        process.on("SIGINT", onSignal);
+        process.on("SIGTERM", onSignal);
+        try {
+            // Use parallel upload for better performance
+            yield uploadInParallel(storage, bucketName, archivePath, gcsKey, cacheSize, tempFiles);
+        }
+        catch (error) {
+            yield deleteObjects(tempFiles);
+            throw error;
+        }
+        finally {
+            process.removeListener("SIGINT", onSignal);
+            process.removeListener("SIGTERM", onSignal);
+        }
+        yield deleteStaleUploadTemps(gcsKey);
         core.info("Cache saved successfully.");
     });
 }
